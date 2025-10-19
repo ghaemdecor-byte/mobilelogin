@@ -155,9 +155,57 @@ class MobileLogin extends Module
         );
     }
 
+    // ======== هوک‌های جدید جایگزین شوند ========
+    
     public function hookDisplayCustomerAccount($params)
     {
-        return $this->display(__FILE__, 'views/templates/hooks/customer-account.tpl');
+        if ($this->context->customer->isLogged()) {
+            $customer_phones = $this->getCustomerPhones($this->context->customer->id);
+            
+            $this->context->smarty->assign([
+                'mobilelogin_customer_phones' => $customer_phones,
+                'mobilelogin_verification_url' => $this->context->link->getModuleLink('mobilelogin', 'verification')
+            ]);
+            
+            return $this->display(__FILE__, 'displayCustomerAccount.tpl');
+        }
+    }
+
+    public function hookDisplayNav2($params)
+    {
+        if ($this->context->customer->isLogged() && Configuration::get('MOBILELOGIN_ENABLED')) {
+            $customer_phones = $this->getCustomerPhones($this->context->customer->id);
+            $has_unverified = false;
+            
+            foreach ($customer_phones as $phone) {
+                if (!$phone['verified']) {
+                    $has_unverified = true;
+                    break;
+                }
+            }
+            
+            if ($has_unverified && Configuration::get('MOBILELOGIN_REQUIRE_VERIFICATION')) {
+                $this->context->smarty->assign([
+                    'mobilelogin_has_unverified_phones' => true,
+                    'mobilelogin_verification_url' => $this->context->link->getModuleLink('mobilelogin', 'verification')
+                ]);
+                
+                return $this->display(__FILE__, 'displayNav2.tpl');
+            }
+        }
+    }
+
+    public function hookDisplayAdminCustomers($params)
+    {
+        $id_customer = (int)$params['id_customer'];
+        $phones = $this->getCustomerPhones($id_customer);
+
+        $this->context->smarty->assign([
+            'mobilelogin_customer_phones' => $phones,
+            'mobilelogin_admin_ajax_url' => $this->context->link->getAdminLink('AdminMobileLogin')
+        ]);
+
+        return $this->display(__FILE__, 'displayAdminCustomers.tpl');
     }
 
     public function hookActionCustomerAccountAdd($params)
@@ -169,6 +217,45 @@ class MobileLogin extends Module
     {
         return $this->processCustomerPhone($params);
     }
+
+    public function hookActionAuthentication($params)
+    {
+        if (!Configuration::get('MOBILELOGIN_ENABLED')) {
+            return;
+        }
+
+        $email = $params['email'];
+        $password = $params['password'];
+        
+        if (Validate::isPhoneNumber($email)) {
+            $customer = $this->findCustomerByPhone($email);
+            if ($customer && Validate::isPasswd($password)) {
+                if ($this->context->customer->login($customer['email'], $password)) {
+                    $this->redirectAfterLogin();
+                }
+            }
+        }
+    }
+
+    public function hookActionBeforeSubmitAccount($params)
+    {
+        if (!Configuration::get('MOBILELOGIN_ENABLED')) {
+            return;
+        }
+
+        $phone = Tools::getValue('phone');
+        
+        if ($phone && !Validate::isPhoneNumber($phone)) {
+            $this->context->controller->errors[] = $this->l('Invalid phone number format');
+        }
+        
+        $national_code = Tools::getValue('national_code');
+        if ($national_code && !$this->validateNationalCode($national_code)) {
+            $this->context->controller->errors[] = $this->l('Invalid national code');
+        }
+    }
+
+    // ======== متدهای کمکی ========
 
     private function processCustomerPhone($params)
     {
@@ -190,24 +277,53 @@ class MobileLogin extends Module
         }
     }
 
-    public function hookDisplayAdminCustomers($params)
-    {
-        $id_customer = (int)$params['id_customer'];
-        $phones = $this->getCustomerPhones($id_customer);
-
-        $this->context->smarty->assign([
-            'customer_phones' => $phones
-        ]);
-
-        return $this->display(__FILE__, 'views/templates/admin/customer_phones.tpl');
-    }
-
     private function getCustomerPhones($id_customer)
     {
         return Db::getInstance()->executeS('
             SELECT * FROM '._DB_PREFIX_.'customer_phone 
             WHERE id_customer = '.(int)$id_customer.'
+            ORDER BY date_add DESC
         ');
+    }
+
+    private function findCustomerByPhone($phone)
+    {
+        $sql = 'SELECT c.* FROM '._DB_PREFIX_.'customer c
+                INNER JOIN '._DB_PREFIX_.'customer_phone cp ON c.id_customer = cp.id_customer
+                WHERE cp.phone = "'.pSQL($phone).'" AND cp.verified = 1
+                AND c.active = 1 AND c.deleted = 0';
+        
+        return Db::getInstance()->getRow($sql);
+    }
+
+    private function validateNationalCode($code)
+    {
+        if (!preg_match('/^\d{10}$/', $code)) {
+            return false;
+        }
+
+        $check = (int)$code[9];
+        $sum = 0;
+        
+        for ($i = 0; $i < 9; $i++) {
+            $sum += (int)$code[$i] * (10 - $i);
+        }
+        
+        $remainder = $sum % 11;
+        
+        return ($remainder < 2 && $check == $remainder) || 
+               ($remainder >= 2 && $check == (11 - $remainder));
+    }
+
+    private function redirectAfterLogin()
+    {
+        $redirect = 'index.php';
+        
+        if (isset($_SERVER['HTTP_REFERER']) && strpos($_SERVER['HTTP_REFERER'], 'authentication') === false) {
+            $redirect = $_SERVER['HTTP_REFERER'];
+        }
+        
+        Tools::redirect($redirect);
     }
 
     public function sendVerificationCode($phone, $customerId = null)
